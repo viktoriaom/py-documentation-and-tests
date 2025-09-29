@@ -1,11 +1,14 @@
 from io import BytesIO
+from unittest.mock import patch
 
 from PIL import Image
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 from rest_framework.reverse import reverse
 from rest_framework.test import APIClient
 
@@ -33,21 +36,76 @@ def sample_movie(**params) -> Movie:
 
 class UnauthenticatedMovieViewSetTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
 
     def test_auth_required(self):
         res = self.client.get(MOVIE_URL)
         self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    @patch("cinema.views.MovieViewSet.permission_classes", [AllowAny])
+    def test_throttling_anonymous(self):
+        cache.clear()
+        for num in range(11):
+            res = self.client.get(MOVIE_URL)
+            if num < 10:
+                self.assertNotEqual(res.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+            else:
+                self.assertEqual(res.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class GetTokensTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def test_tokens(self):
+        get_user_model().objects.create_user(
+            email="test@example.com", password="testpass123"
+        )
+        response = self.client.post(
+            "/api/user/token/", {"email": "test@example.com", "password": "testpass123"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+
+        refresh_token = response.data["refresh"]
+
+        refresh_res = self.client.post(
+            "/api/user/token/refresh/", {"refresh": refresh_token}
+        )
+
+        self.assertEqual(refresh_res.status_code, 200)
+        self.assertIn("access", refresh_res.data)
+
 
 class AuthenticatedMovieViewSetTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
         self.user = get_user_model().objects.create_user(
             email="test_user@example.com",
             password="testuser",
         )
-        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/user/token/",
+            {"email": "test_user@example.com", "password": "testuser"},
+        )
+
+        self.token = response.data["access"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
+
+    def test_list_movies_missing_token(self):
+        self.client.credentials()  # Remove token
+        res = self.client.get(MOVIE_URL)
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_list_movies_invalid_token(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Bearer invalidtoken123")
+        res = self.client.get(MOVIE_URL)
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_movies_list(self):
         sample_movie()
@@ -79,12 +137,8 @@ class AuthenticatedMovieViewSetTests(TestCase):
         movie_one = sample_movie(title="Inception")
         movie_two = sample_movie(title="Interstellar")
 
-        actor_one = Actor.objects.create(first_name="Leonardo",
-                                         last_name="DiCaprio"
-                                         )
-        actor_two = Actor.objects.create(first_name="Matthew",
-                                         last_name="McConaughey"
-                                         )
+        actor_one = Actor.objects.create(first_name="Leonardo", last_name="DiCaprio")
+        actor_two = Actor.objects.create(first_name="Matthew", last_name="McConaughey")
 
         movie_one.actors.add(actor_one)
         movie_two.actors.add(actor_two)
@@ -128,11 +182,6 @@ class AuthenticatedMovieViewSetTests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertEqual(res.data, serializer.data)
 
-        res = self.client.post(
-            reverse("cinema:movie-detail", kwargs={"pk": movie_one.id})
-        )
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
     def test_create_movie_not_admin_forbidden(self):
         payload = {
             "title": "Inception",
@@ -142,18 +191,46 @@ class AuthenticatedMovieViewSetTests(TestCase):
         res = self.client.post(MOVIE_URL, payload)
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_put_movie_not_admin_forbidden(self):
+        movie = sample_movie()
+        movie = Movie.objects.get(id=movie.id)
+        payload = {
+            "title": "NewMovieTitle",
+            "description": "NewMovieDescription",
+            "duration": 12345,
+        }
+        movie_to_put_url = reverse("cinema:movie-detail", kwargs={"pk": movie.id})
+        res = self.client.put(movie_to_put_url, payload)
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_patch_movie_not_admin_forbidden(self):
+        movie = sample_movie()
+        movie = Movie.objects.get(id=movie.id)
+        payload = {
+            "duration": 12345,
+        }
+        movie_to_patch_url = reverse("cinema:movie-detail", kwargs={"pk": movie.id})
+        res = self.client.patch(movie_to_patch_url, payload)
+
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_movie_image_not_admin_forbidden(self):
         movie = sample_movie()
         url = reverse("cinema:movie-upload-image", kwargs={"pk": movie.id})
         image = SimpleUploadedFile(
-            name="test.jpg",
-            content=b"fake-image-content",
-            content_type="image/jpeg"
+            name="test.jpg", content=b"fake-image-content", content_type="image/jpeg"
         )
 
         res = self.client.post(url, {"image": image}, format="multipart")
         movie.refresh_from_db()
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_throttling_user(self):
+        cache.clear()
+        for num in range(31):
+            res = self.client.get(MOVIE_URL)
+        self.assertEqual(res.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
 
 class AdminMovieViewSetTests(TestCase):
@@ -164,26 +241,52 @@ class AdminMovieViewSetTests(TestCase):
             password="testadmin",
             is_staff=True,
         )
-        self.client.force_authenticate(self.user)
+        response = self.client.post(
+            "/api/user/token/",
+            {"email": "test_admin@example.com", "password": "testadmin"},
+        )
+        self.token = response.data["access"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.token}")
 
     def test_create_movie_admin(self):
         genre = Genre.objects.create(name="action")
-        actor = Actor.objects.create(
-            first_name="Matthew",
-            last_name="McConaughey"
-        )
+        actor = Actor.objects.create(first_name="Matthew", last_name="McConaughey")
         payload = {
             "title": "Inception",
             "description": "MovieDescription",
             "duration": 12345,
-            "actors": actor.id,
-            "genres": genre.id,
+            "actors": [actor.id],
+            "genres": [genre.id],
         }
         res = self.client.post(MOVIE_URL, payload)
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         movie = Movie.objects.get(title="Inception")
         self.assertEqual(movie.description, "MovieDescription")
         self.assertEqual(movie.duration, 12345)
+
+    def test_put_movie_admin(self):
+        movie = sample_movie()
+        movie = Movie.objects.get(id=movie.id)
+        payload = {
+            "title": "NewMovieTitle",
+            "description": "NewMovieDescription",
+            "duration": 12345,
+        }
+        movie_to_put_url = reverse("cinema:movie-detail", kwargs={"pk": movie.id})
+        res = self.client.put(movie_to_put_url, payload)
+
+        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_patch_movie_admin(self):
+        movie = sample_movie()
+        movie = Movie.objects.get(id=movie.id)
+        payload = {
+            "duration": 12345,
+        }
+        movie_to_patch_url = reverse("cinema:movie-detail", kwargs={"pk": movie.id})
+        res = self.client.patch(movie_to_patch_url, payload)
+
+        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def test_delete_movie_admin_forbidden(self):
         movie_one = sample_movie(title="Inception")
@@ -192,7 +295,10 @@ class AdminMovieViewSetTests(TestCase):
         res = self.client.get(MOVIE_URL)
         self.assertIn(serializer.data, res.data)
 
-        res = self.client.delete(MOVIE_URL, pk=movie_one.id)
+        movie_to_delete_url = reverse(
+            "cinema:movie-detail", kwargs={"pk": movie_one.id}
+        )
+        res = self.client.delete(movie_to_delete_url)
         self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def test_admin_add_movie_image(self):
@@ -208,10 +314,7 @@ class AdminMovieViewSetTests(TestCase):
             name="test.jpg", content=image_io.read(), content_type="image/jpeg"
         )
 
-        res = self.client.post(url,
-                               {"image": uploaded_image},
-                               format="multipart"
-                               )
+        res = self.client.post(url, {"image": uploaded_image}, format="multipart")
         movie.refresh_from_db()
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
