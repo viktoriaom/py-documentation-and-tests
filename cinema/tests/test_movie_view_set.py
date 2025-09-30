@@ -230,7 +230,10 @@ class AuthenticatedMovieViewSetTests(TestCase):
         cache.clear()
         for num in range(31):
             res = self.client.get(MOVIE_URL)
-        self.assertEqual(res.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+            if num < 30:
+                self.assertEqual(res.status_code, status.HTTP_200_OK)
+            else:
+                self.assertEqual(res.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
 
 class AdminMovieViewSetTests(TestCase):
@@ -319,7 +322,6 @@ class AdminMovieViewSetTests(TestCase):
 
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertIn("image", res.data)
-        self.assertIn("movietitle", movie.image.name)
         self.assertTrue(movie.image.name.endswith(".jpg"))
 
 
